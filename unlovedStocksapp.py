@@ -382,11 +382,26 @@ if run_btn:
             .merge(fund, on="symbol", how="left")
     )
 
+    with st.expander("Debug: row counts / columns (hide when done)"):
+        st.write("Rows — universe:", len(univ), "prices:", len(prices), "fundamentals:", len(fund))
+        st.write("Base columns:", list(base.columns))
+        st.write("Sample fundamentals rows:", fund.head(5))
+
+    # --- SAFETY: ensure all filter columns exist, even if fundamentals were sparse ---
+    needed_cols = ["op_margin", "net_margin", "rev_ttm_growth", "marketCap", "ret_3m", "ret_6m", "last_price"]
+    for c in needed_cols:
+        if c not in base.columns:
+            base[c] = np.nan
+    # Make sure numeric where relevant
+    for c in ["op_margin", "net_margin", "rev_ttm_growth", "marketCap", "ret_3m", "ret_6m", "last_price"]:
+        base[c] = pd.to_numeric(base[c], errors="coerce")
+
+
     # Apply filters
     df = base.copy()
 
     if unloved_required:
-        df = df[(df["ret_3m"] < 0) & (df["ret_6m"] < 0)]
+        df = df[df["ret_3m"].lt(0, fill_value=False) & df["ret_6m"].lt(0, fill_value=False)]
 
     df = df[(df["op_margin"] >= min_op_margin) & (df["net_margin"] >= min_net_margin)]
     df = df[(df["rev_ttm_growth"] >= min_rev_growth)]
