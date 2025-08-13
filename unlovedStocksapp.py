@@ -217,7 +217,7 @@ def get_fundamentals(tickers: List[str]) -> pd.DataFrame:
             ])
 
         merged = (
-            ttm.merge(mcap, on="symbol", how="left")
+            ttm.merge(mcap_df, on="symbol", how="left")
                .merge(prof, on="symbol", how="left")
         )
         df_list.append(merged)
