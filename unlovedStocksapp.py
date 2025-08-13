@@ -116,33 +116,54 @@ def get_fundamentals(tickers: List[str]) -> pd.DataFrame:
         except Exception:
             inc_q = pd.DataFrame()
 
-        # Key stats / price for market cap
+                # ---- Market cap (robust): try .price first, then .summary_detail ----
+        mcap_df = pd.DataFrame(columns=["symbol", "marketCap"])
         try:
-            key_stats = tk.key_stats
-            if not isinstance(key_stats, pd.DataFrame):
-                key_stats = pd.DataFrame(key_stats).T
+            price = tk.price
+            if isinstance(price, pd.DataFrame):
+                tmp = price.reset_index()
+            else:
+                tmp = pd.DataFrame(price).T.reset_index()
+            # normalize symbol column
+            if "symbol" not in tmp.columns and "index" in tmp.columns:
+                tmp = tmp.rename(columns={"index": "symbol"})
+            if "marketCap" in tmp.columns and "symbol" in tmp.columns:
+                mcap_df = tmp[["symbol", "marketCap"]].copy()
         except Exception:
-            key_stats = pd.DataFrame()
+            pass
 
-        # Profile for sector/industry
+        if mcap_df.empty:
+            try:
+                sd = tk.summary_detail
+                if not isinstance(sd, pd.DataFrame):
+                    sd = pd.DataFrame(sd).T
+                tmp = sd.reset_index()
+                if "symbol" not in tmp.columns and "index" in tmp.columns:
+                    tmp = tmp.rename(columns={"index": "symbol"})
+                if "marketCap" in tmp.columns and "symbol" in tmp.columns:
+                    mcap_df = tmp[["symbol", "marketCap"]].copy()
+            except Exception:
+                pass
+
+        # ---- Sector/industry profile (robust) ----
+        prof = pd.DataFrame(columns=["symbol", "sector", "industry"])
         try:
             profile = tk.summary_profile
             if not isinstance(profile, pd.DataFrame):
                 profile = pd.DataFrame(profile).T
+            tmp = profile.reset_index()
+            if "symbol" not in tmp.columns and "index" in tmp.columns:
+                tmp = tmp.rename(columns={"index": "symbol"})
+            have = [c for c in ["symbol", "sector", "industry"] if c in tmp.columns]
+            if set(["symbol"]).issubset(have):
+                # add missing cols if needed
+                for col in ["sector", "industry"]:
+                    if col not in tmp.columns:
+                        tmp[col] = np.nan
+                prof = tmp[["symbol", "sector", "industry"]].copy()
         except Exception:
-            profile = pd.DataFrame()
+            pass
 
-        # Normalize fields
-        mcap = (
-            key_stats.reset_index()[["symbol", "marketCap"]]
-            if not key_stats.empty
-            else pd.DataFrame(columns=["symbol", "marketCap"])
-        )
-        prof = (
-            profile.reset_index()[["symbol", "sector", "industry"]]
-            if not profile.empty
-            else pd.DataFrame(columns=["symbol", "sector", "industry"])
-        )
 
         if isinstance(inc_q, pd.DataFrame) and not inc_q.empty:
             inc_q = inc_q.reset_index()
@@ -274,7 +295,7 @@ if run_btn:
 
     base = (
         univ.merge(prices, on="symbol", how="left")
-            .merge(fund, on=["symbol", "sector"], how="left")
+            .merge(fund, on=["symbol"], how="left")
     )
 
     # Filters
