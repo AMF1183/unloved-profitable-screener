@@ -291,7 +291,18 @@ def get_fundamentals(tickers: List[str]) -> pd.DataFrame:
         # Be nice to endpoints
         time.sleep(0.5)
 
-    return pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
+        # ----- finalize -----
+    out = pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
+
+    # Guarantee we always return a frame with a 'symbol' column
+    if out is None or out.empty:
+        return pd.DataFrame({"symbol": []})
+
+    if "symbol" not in out.columns:
+        out = out.reset_index().rename(columns={"index": "symbol"})
+
+    out["symbol"] = out["symbol"].astype(str)
+    return out
 
 
 # --------------------------
@@ -356,6 +367,14 @@ if run_btn:
 
     with st.spinner("Fetching fundamentals (TTM margins & revenue growth)…"):
         fund = get_fundamentals(tickers)
+
+    # Safety: make sure 'symbol' exists in fund even if upstream changed shape
+    if fund is None or fund.empty:
+        fund = pd.DataFrame({"symbol": []})
+    elif "symbol" not in fund.columns:
+        fund = fund.reset_index().rename(columns={"index": "symbol"})
+    fund["symbol"] = fund["symbol"].astype(str)
+
 
     # Safe merge only on symbol (sector strings can be inconsistent/missing)
     base = (
