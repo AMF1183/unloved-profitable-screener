@@ -1,44 +1,65 @@
-# app.py
-# Streamlit dashboard to screen for US stocks that are down over 3–6 months
-# but still show healthy margins and sales growth.
+# unlovedStocksapp.py
+# Streamlit dashboard to find US stocks that are "unloved" (3m & 6m price < 0)
+# but still have healthy margins and sales growth (TTM).
+#
+# Copy into unlovedStocksapp.py, keep requirements.txt in the repo root:
+# streamlit>=1.34
+# yfinance>=0.2.52
+# yahooquery>=2.4.1
+# pandas>=2.0
+# numpy>=1.25
 
-import io
-import math
+from __future__ import annotations
+
 import time
-from typing import List, Tuple
+from typing import List
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import streamlit as st
 
-# External data packages
-try:
-    import yfinance as yf
-except Exception as e:
-    st.error("Failed to import yfinance. Run: pip install yfinance")
-    raise
+# External data libs
+import yfinance as yf
+from yahooquery import Ticker
 
-try:
-    from yahooquery import Ticker
-except Exception as e:
-    st.error("Failed to import yahooquery. Run: pip install yahooquery")
-    raise
 
+# --------------------------
+# Streamlit page config
+# --------------------------
 st.set_page_config(
     page_title="Unloved but Profitable — US Equity Screener",
     page_icon="📉",
     layout="wide",
 )
 
+st.title("📉 Unloved but Profitable — US Equity Screener")
+st.caption(
+    "Screens US equities for negative 3–6m performance but positive TTM margins and sales growth. "
+    "Data source: Yahoo Finance (prices via yfinance, fundamentals via yahooquery)."
+)
+
+
 # --------------------------
 # Helpers
 # --------------------------
+def _chunk_list(lst: List[str], n: int) -> List[List[str]]:
+    return [lst[i : i + n] for i in range(0, len(lst), n)]
 
+
+def _fmt_pct(x):
+    return "" if pd.isna(x) else f"{100*x:.1f}%"
+
+
+def _safe_div(a, b):
+    return np.nan if (b is None or pd.isna(b) or b == 0) else a / b
+
+
+# --------------------------
+# Universe
+# --------------------------
 @st.cache_data(ttl=60 * 60)
 def get_sp500_universe() -> pd.DataFrame:
-    """Fetch S&P 500 constituents from Wikipedia.
-    Returns a DataFrame with columns: symbol, security, sector, sub_industry
-    """
+    """Fetch S&P 500 constituents from Wikipedia."""
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     tables = pd.read_html(url)
     df = tables[0].rename(
@@ -49,19 +70,21 @@ def get_sp500_universe() -> pd.DataFrame:
             "GICS Sub-Industry": "sub_industry",
         }
     )
-    df["symbol"] = df["symbol"].str.replace("\.", "-", regex=False)  # BRK.B -> BRK-B
+    # Normalize Yahoo tickers (BRK.B -> BRK-B, BF.B -> BF-B, etc.)
+    df["symbol"] = df["symbol"].astype(str).str.replace(".", "-", regex=False)
     return df[["symbol", "security", "sector", "sub_industry"]]
 
 
-def chunk_list(lst: List[str], n: int) -> List[List[str]]:
-    return [lst[i : i + n] for i in range(0, len(lst), n)]
-
-
+# --------------------------
+# Prices (3m / 6m returns)
+# --------------------------
 @st.cache_data(ttl=60 * 60)
 def get_price_returns(tickers: List[str]) -> pd.DataFrame:
-    """Download 1y daily prices and compute 3m & 6m returns (Adj Close)."""
-    if len(tickers) == 0:
+    """Download ~1y prices and compute 3m (~63d) & 6m (~126d) returns."""
+    if not tickers:
         return pd.DataFrame()
+
+    # yfinance supports batch download; auto_adjust=True gives total returns (split/div adjusted)
     data = yf.download(
         tickers=tickers,
         period="1y",
@@ -75,217 +98,258 @@ def get_price_returns(tickers: List[str]) -> pd.DataFrame:
     rows = []
     for t in tickers:
         try:
-            s = data[t]["Close"].dropna()
+            # For multi-ticker, data[t]["Close"]; for single-ticker, data["Close"]
+            s = data[t]["Close"].dropna() if isinstance(data.columns, pd.MultiIndex) else data["Close"].dropna()
         except Exception:
-            # Single-ticker download returns a different shape
-            try:
-                s = data["Close"].dropna()
-            except Exception:
-                continue
+            continue
         if s.empty:
             continue
+
         last = s.iloc[-1]
-        # 3m ~ 63 trading days, 6m ~ 126 trading days
-        ret_3m = (last / s.iloc[-63] - 1.0) if len(s) > 63 else np.nan
-        ret_6m = (last / s.iloc[-126] - 1.0) if len(s) > 126 else np.nan
+        ret_3m = np.nan
+        ret_6m = np.nan
+        if len(s) > 63:
+            ret_3m = last / s.iloc[-63] - 1.0
+        if len(s) > 126:
+            ret_6m = last / s.iloc[-126] - 1.0
+
         rows.append({"symbol": t, "ret_3m": ret_3m, "ret_6m": ret_6m, "last_price": last})
+
     return pd.DataFrame(rows)
 
 
+# --------------------------
+# Fundamentals (TTM)
+# --------------------------
 @st.cache_data(ttl=60 * 60)
 def get_fundamentals(tickers: List[str]) -> pd.DataFrame:
     """Pull quarterly income statements via yahooquery and compute TTM metrics.
-
-    Returns columns: symbol, revenue_ttm, gross_profit_ttm, operating_income_ttm,
-    net_income_ttm, gross_margin, op_margin, net_margin, rev_ttm_prev, rev_ttm_growth,
-    market_cap, sector, industry
+    Returns columns: symbol, revenue_ttm, gross_profit_ttm, operating_income_ttm, net_income_ttm,
+    gross_margin, op_margin, net_margin, rev_ttm_growth, marketCap, sector, industry
     """
-    if len(tickers) == 0:
+    if not tickers:
         return pd.DataFrame()
 
-    df_list = []
-    for batch in chunk_list(tickers, 30):  # keep batches modest to reduce rate limits
-        tk = Ticker(batch, asynchronous=True)
+    out_frames = []
 
-        # Quarterly income statements
-        try:
-            inc_q = tk.income_statement(trailing=True, quarterly=True)
-            if isinstance(inc_q, dict):
-                # yahooquery may return error dict; coerce to empty
-                inc_q = pd.DataFrame()
-        except Exception:
-            inc_q = pd.DataFrame()
+    # Keep batches modest and retry on flaky network/timeouts to reduce empty results.
+    for batch in _chunk_list(tickers, 15):
+        inc_q = pd.DataFrame()
+        price = {}
+        summary_detail = {}
+        profile = {}
 
-                # ---- Market cap (robust): try .price first, then .summary_detail ----
+        # simple retry loop
+        for attempt in range(3):
+            try:
+                tk = Ticker(batch, asynchronous=True)
+
+                # Quarterly income statement (trailing=True returns historical quarters)
+                _inc = tk.income_statement(trailing=True, quarterly=True)
+                if isinstance(_inc, pd.DataFrame):
+                    inc_q = _inc
+                elif isinstance(_inc, dict):
+                    # Some responses are dicts keyed by symbol -> dict; coerce
+                    inc_q = pd.DataFrame(_inc).T.reset_index(names="symbol")
+                else:
+                    inc_q = pd.DataFrame()
+
+                # For market cap, try .price first, then .summary_detail
+                price = tk.price
+                summary_detail = tk.summary_detail
+
+                # Sector/industry
+                profile = tk.summary_profile
+                break
+            except Exception:
+                time.sleep(0.8)  # backoff and retry
+        else:
+            # All attempts failed → skip this batch
+            continue
+
+        # ------- Normalize market cap -------
         mcap_df = pd.DataFrame(columns=["symbol", "marketCap"])
         try:
-            price = tk.price
-            if isinstance(price, pd.DataFrame):
-                tmp = price.reset_index()
-            else:
-                tmp = pd.DataFrame(price).T.reset_index()
-            # normalize symbol column
-            if "symbol" not in tmp.columns and "index" in tmp.columns:
-                tmp = tmp.rename(columns={"index": "symbol"})
-            if "marketCap" in tmp.columns and "symbol" in tmp.columns:
-                mcap_df = tmp[["symbol", "marketCap"]].copy()
+            pr = price
+            pr_df = pr if isinstance(pr, pd.DataFrame) else pd.DataFrame(pr).T
+            pr_df = pr_df.reset_index()
+            if "symbol" not in pr_df.columns and "index" in pr_df.columns:
+                pr_df = pr_df.rename(columns={"index": "symbol"})
+            if {"symbol", "marketCap"} <= set(pr_df.columns):
+                mcap_df = pr_df[["symbol", "marketCap"]].copy()
         except Exception:
             pass
 
         if mcap_df.empty:
             try:
-                sd = tk.summary_detail
-                if not isinstance(sd, pd.DataFrame):
-                    sd = pd.DataFrame(sd).T
-                tmp = sd.reset_index()
-                if "symbol" not in tmp.columns and "index" in tmp.columns:
-                    tmp = tmp.rename(columns={"index": "symbol"})
-                if "marketCap" in tmp.columns and "symbol" in tmp.columns:
-                    mcap_df = tmp[["symbol", "marketCap"]].copy()
+                sd = summary_detail
+                sd_df = sd if isinstance(sd, pd.DataFrame) else pd.DataFrame(sd).T
+                sd_df = sd_df.reset_index()
+                if "symbol" not in sd_df.columns and "index" in sd_df.columns:
+                    sd_df = sd_df.rename(columns={"index": "symbol"})
+                if {"symbol", "marketCap"} <= set(sd_df.columns):
+                    mcap_df = sd_df[["symbol", "marketCap"]].copy()
             except Exception:
                 pass
 
-        # ---- Sector/industry profile (robust) ----
-        prof = pd.DataFrame(columns=["symbol", "sector", "industry"])
+        # ------- Sector / industry -------
+        prof_df = pd.DataFrame(columns=["symbol", "sector", "industry"])
         try:
-            profile = tk.summary_profile
-            if not isinstance(profile, pd.DataFrame):
-                profile = pd.DataFrame(profile).T
-            tmp = profile.reset_index()
-            if "symbol" not in tmp.columns and "index" in tmp.columns:
-                tmp = tmp.rename(columns={"index": "symbol"})
-            have = [c for c in ["symbol", "sector", "industry"] if c in tmp.columns]
-            if set(["symbol"]).issubset(have):
-                # add missing cols if needed
-                for col in ["sector", "industry"]:
-                    if col not in tmp.columns:
-                        tmp[col] = np.nan
-                prof = tmp[["symbol", "sector", "industry"]].copy()
+            pf = profile
+            pf_df = pf if isinstance(pf, pd.DataFrame) else pd.DataFrame(pf).T
+            pf_df = pf_df.reset_index()
+            if "symbol" not in pf_df.columns and "index" in pf_df.columns:
+                pf_df = pf_df.rename(columns={"index": "symbol"})
+            # Ensure presence of all columns
+            for col in ["sector", "industry"]:
+                if col not in pf_df.columns:
+                    pf_df[col] = np.nan
+            if "symbol" in pf_df.columns:
+                prof_df = pf_df[["symbol", "sector", "industry"]].copy()
         except Exception:
             pass
 
-
+        # ------- Income statement TTM metrics -------
         if isinstance(inc_q, pd.DataFrame) and not inc_q.empty:
-            inc_q = inc_q.reset_index()
-            # Ensure numeric
-            for col in [
-                "TotalRevenue",
-                "GrossProfit",
-                "OperatingIncome",
-                "NetIncome",
-            ]:
-                if col in inc_q.columns:
-                    inc_q[col] = pd.to_numeric(inc_q[col], errors="coerce")
-            # Compute TTM by summing last 4 quarters per symbol
-            ttm = (
-                inc_q.sort_values(["symbol", "asOfDate"])  # asOfDate ascending
-                .groupby("symbol")
-                .apply(lambda g: pd.Series(
+            inc_q = inc_q.reset_index(drop=False)
+            # Normalize column names across possible variants
+            rename_map = {
+                "TotalRevenue": "total_revenue",
+                "GrossProfit": "gross_profit",
+                "OperatingIncome": "operating_income",
+                "NetIncome": "net_income",
+            }
+            for k, v in rename_map.items():
+                if k in inc_q.columns:
+                    inc_q[v] = pd.to_numeric(inc_q[k], errors="coerce")
+            # Yahoo sometimes uses lower-case already
+            for col in ["total_revenue", "gross_profit", "operating_income", "net_income"]:
+                if col not in inc_q.columns:
+                    inc_q[col] = pd.to_numeric(inc_q.get(col, np.nan), errors="coerce")
+
+            # asOfDate may be present; if not, we still group and take last rows
+            if "symbol" not in inc_q.columns:
+                # Some shapes use column named "ticker" or index
+                if "ticker" in inc_q.columns:
+                    inc_q = inc_q.rename(columns={"ticker": "symbol"})
+                elif "index" in inc_q.columns:
+                    inc_q = inc_q.rename(columns={"index": "symbol"})
+
+            inc_q = inc_q.sort_values(["symbol"] + ([c for c in ["asOfDate"] if c in inc_q.columns]))
+
+            def compute_ttm(g: pd.DataFrame) -> pd.Series:
+                # take last 8 quarters; last 4 = TTM, prev 4 = previous TTM
+                last4 = g.tail(4)
+                prev4 = g.tail(8).head(4)
+                revenue_ttm = pd.to_numeric(last4["total_revenue"], errors="coerce").sum(skipna=True)
+                gross_profit_ttm = pd.to_numeric(last4["gross_profit"], errors="coerce").sum(skipna=True)
+                operating_income_ttm = pd.to_numeric(last4["operating_income"], errors="coerce").sum(skipna=True)
+                net_income_ttm = pd.to_numeric(last4["net_income"], errors="coerce").sum(skipna=True)
+                rev_prev = pd.to_numeric(prev4["total_revenue"], errors="coerce").sum(skipna=True)
+                gross_margin = _safe_div(gross_profit_ttm, revenue_ttm)
+                op_margin = _safe_div(operating_income_ttm, revenue_ttm)
+                net_margin = _safe_div(net_income_ttm, revenue_ttm)
+                rev_growth = np.nan if (pd.isna(rev_prev) or rev_prev == 0) else (revenue_ttm - rev_prev) / rev_prev
+                return pd.Series(
                     {
-                        "revenue_ttm": g["TotalRevenue"].tail(4).sum(skipna=True),
-                        "gross_profit_ttm": g["GrossProfit"].tail(4).sum(skipna=True),
-                        "operating_income_ttm": g["OperatingIncome"].tail(4).sum(skipna=True),
-                        "net_income_ttm": g["NetIncome"].tail(4).sum(skipna=True),
-                        "rev_ttm_prev": g["TotalRevenue"].tail(8).head(4).sum(skipna=True),
+                        "revenue_ttm": revenue_ttm,
+                        "gross_profit_ttm": gross_profit_ttm,
+                        "operating_income_ttm": operating_income_ttm,
+                        "net_income_ttm": net_income_ttm,
+                        "rev_ttm_prev": rev_prev,
+                        "gross_margin": gross_margin,
+                        "op_margin": op_margin,
+                        "net_margin": net_margin,
+                        "rev_ttm_growth": rev_growth,
                     }
-                ))
-                .reset_index()
-            )
-            # Margins and growth
-            def safe_div(a, b):
-                return np.nan if (b is None or b == 0 or pd.isna(b)) else a / b
+                )
 
-            ttm["gross_margin"] = [safe_div(a, b) for a, b in zip(ttm["gross_profit_ttm"], ttm["revenue_ttm"])]
-            ttm["op_margin"] = [safe_div(a, b) for a, b in zip(ttm["operating_income_ttm"], ttm["revenue_ttm"])]
-            ttm["net_margin"] = [safe_div(a, b) for a, b in zip(ttm["net_income_ttm"], ttm["revenue_ttm"])]
-            ttm["rev_ttm_growth"] = [
-                np.nan if (pd.isna(prev) or prev == 0) else (rev - prev) / prev
-                for rev, prev in zip(ttm["revenue_ttm"], ttm["rev_ttm_prev"])
-            ]
+            ttm = inc_q.groupby("symbol", as_index=False).apply(compute_ttm).reset_index(drop=True)
         else:
-            ttm = pd.DataFrame(columns=[
-                "symbol",
-                "revenue_ttm",
-                "gross_profit_ttm",
-                "operating_income_ttm",
-                "net_income_ttm",
-                "rev_ttm_prev",
-                "gross_margin",
-                "op_margin",
-                "net_margin",
-                "rev_ttm_growth",
-            ])
+            ttm = pd.DataFrame(
+                columns=[
+                    "symbol",
+                    "revenue_ttm",
+                    "gross_profit_ttm",
+                    "operating_income_ttm",
+                    "net_income_ttm",
+                    "rev_ttm_prev",
+                    "gross_margin",
+                    "op_margin",
+                    "net_margin",
+                    "rev_ttm_growth",
+                ]
+            )
 
+        # Merge everything for this batch
         merged = (
             ttm.merge(mcap_df, on="symbol", how="left")
-               .merge(prof, on="symbol", how="left")
+               .merge(prof_df, on="symbol", how="left")
         )
-        df_list.append(merged)
+        out_frames.append(merged)
 
-        # Gentle sleep to be nice to endpoints
+        # Be nice to endpoints
         time.sleep(0.5)
 
-    out = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
-    return out
-
-
-def fmt_pct(x):
-    return "" if pd.isna(x) else f"{100*x:.1f}%"
+    return pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
 
 
 # --------------------------
-# UI — Sidebar controls
+# Sidebar controls
 # --------------------------
-
-st.title("📉 Unloved but Profitable — US Equity Screener")
-
 with st.sidebar:
     st.header("Universe & Filters")
-    st.write("Choose your universe and set minimum fundamentals.")
 
     universe_choice = st.selectbox(
         "Stock universe",
-        ["S&P 500 (auto)", "Upload custom tickers (CSV)"]
+        ["S&P 500 (auto)", "Upload custom tickers (CSV with 'symbol' column)"],
     )
 
     uploaded = None
-    if universe_choice == "Upload custom tickers (CSV)":
-        uploaded = st.file_uploader("Upload a CSV with a 'symbol' column", type=["csv"])    
+    if universe_choice == "Upload custom tickers (CSV with 'symbol' column)":
+        uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        min_op_margin = st.number_input("Min operating margin", value=0.10, min_value=-1.0, max_value=1.0, step=0.01)
-        min_rev_growth = st.number_input("Min revenue growth (TTM)", value=0.05, min_value=-1.0, max_value=2.0, step=0.01)
-    with col_b:
-        min_net_margin = st.number_input("Min net margin", value=0.05, min_value=-1.0, max_value=1.0, step=0.01)
-        min_mcap = st.number_input("Min market cap (USD, billions)", value=5.0, min_value=0.0, step=1.0)
+    c1, c2 = st.columns(2)
+    with c1:
+        min_op_margin = st.number_input("Min operating margin (TTM)", value=0.10, min_value=-1.0, max_value=1.0, step=0.01)
+        min_net_margin = st.number_input("Min net margin (TTM)", value=0.05, min_value=-1.0, max_value=1.0, step=0.01)
+    with c2:
+        min_rev_growth = st.number_input("Min revenue growth (TTM YoY)", value=0.05, min_value=-1.0, max_value=2.0, step=0.01)
+        min_mcap_b = st.number_input("Min market cap (USD, billions)", value=5.0, min_value=0.0, step=1.0)
 
-    unloved_window_help = "Both past 3m and 6m price returns must be negative."
-    unloved_required = st.checkbox("Require 3m & 6m performance < 0", value=True, help=unloved_window_help)
+    unloved_required = st.checkbox(
+        "Require both 3m & 6m performance < 0", value=True,
+        help="If checked, only shows stocks with negative returns over both 3 and 6 months."
+    )
 
     sector_filter = st.text_input("Filter sectors (comma-separated, optional)")
 
     run_btn = st.button("Run Screener", type="primary")
 
-# --------------------------
-# Data pipeline
-# --------------------------
 
+# --------------------------
+# Pipeline
+# --------------------------
 if run_btn:
-    # Universe
+    # Build universe
     if universe_choice == "S&P 500 (auto)":
         univ = get_sp500_universe()
     else:
-        if uploaded is None:
+        if not uploaded:
             st.warning("Please upload a CSV with a 'symbol' column.")
             st.stop()
         tmp = pd.read_csv(uploaded)
         if "symbol" not in tmp.columns:
-            st.error("Your CSV must have a 'symbol' column.")
+            st.error("Your CSV must contain a 'symbol' column.")
             st.stop()
-        univ = tmp[["symbol"]].assign(security=np.nan, sector=np.nan, sub_industry=np.nan)
+        univ = tmp[["symbol"]].copy()
+        univ["security"] = np.nan
+        univ["sector"] = np.nan
+        univ["sub_industry"] = np.nan
+        # Normalize symbols for Yahoo
+        univ["symbol"] = univ["symbol"].astype(str).str.replace(".", "-", regex=False)
 
-    tickers = sorted(univ["symbol"].dropna().unique().tolist())
+    tickers = sorted(univ["symbol"].dropna().astype(str).str.replace(".", "-", regex=False).unique().tolist())
 
     with st.spinner(f"Downloading prices for {len(tickers)} tickers…"):
         prices = get_price_returns(tickers)
@@ -293,12 +357,13 @@ if run_btn:
     with st.spinner("Fetching fundamentals (TTM margins & revenue growth)…"):
         fund = get_fundamentals(tickers)
 
+    # Safe merge only on symbol (sector strings can be inconsistent/missing)
     base = (
         univ.merge(prices, on="symbol", how="left")
-            .merge(fund, on=["symbol"], how="left")
+            .merge(fund, on="symbol", how="left")
     )
 
-    # Filters
+    # Apply filters
     df = base.copy()
 
     if unloved_required:
@@ -306,84 +371,105 @@ if run_btn:
 
     df = df[(df["op_margin"] >= min_op_margin) & (df["net_margin"] >= min_net_margin)]
     df = df[(df["rev_ttm_growth"] >= min_rev_growth)]
-    df = df[(df["marketCap"].fillna(0) >= min_mcap * 1e9)]
+    df = df[(df["marketCap"].fillna(0) >= min_mcap_b * 1e9)]
 
     if sector_filter.strip():
         wanted = {s.strip().lower() for s in sector_filter.split(",") if s.strip()}
         df = df[df["sector"].astype(str).str.lower().isin(wanted)]
 
-    # Presentation
+    # Present results
     if df.empty:
-        st.warning("No matches with current filters. Try relaxing thresholds or uploading a different universe.")
+        st.warning("No matches with current filters. Try relaxing thresholds or confirm data fetched successfully.")
         st.stop()
 
-    # Nice columns
-    view = df[[
-        "symbol", "security", "sector", "last_price", "ret_3m", "ret_6m",
-        "revenue_ttm", "rev_ttm_growth", "op_margin", "net_margin", "marketCap"
-    ]].copy()
+    view = df[
+        [
+            "symbol",
+            "security",
+            "sector",
+            "last_price",
+            "ret_3m",
+            "ret_6m",
+            "revenue_ttm",
+            "rev_ttm_growth",
+            "op_margin",
+            "net_margin",
+            "marketCap",
+        ]
+    ].copy()
 
-    view = view.rename(columns={
-        "last_price": "Price",
-        "ret_3m": "3m%",
-        "ret_6m": "6m%",
-        "revenue_ttm": "Revenue TTM",
-        "rev_ttm_growth": "Rev TTM YoY%",
-        "op_margin": "Op Margin%",
-        "net_margin": "Net Margin%",
-        "marketCap": "Mkt Cap",
-    })
+    view = view.rename(
+        columns={
+            "last_price": "Price",
+            "ret_3m": "3m%",
+            "ret_6m": "6m%",
+            "revenue_ttm": "Revenue TTM",
+            "rev_ttm_growth": "Rev TTM YoY%",
+            "op_margin": "Op Margin%",
+            "net_margin": "Net Margin%",
+            "marketCap": "Mkt Cap",
+        }
+    )
 
-    # Formatting for display
-    view["3m%"] = view["3m%"].apply(fmt_pct)
-    view["6m%"] = view["6m%"].apply(fmt_pct)
-    view["Rev TTM YoY%"] = view["Rev TTM YoY%"].apply(fmt_pct)
-    view["Op Margin%"] = view["Op Margin%"].apply(fmt_pct)
-    view["Net Margin%"] = view["Net Margin%"].apply(fmt_pct)
+    # Nicely format
+    for col in ["3m%", "6m%", "Rev TTM YoY%", "Op Margin%", "Net Margin%"]:
+        view[col] = view[col].apply(_fmt_pct)
     view["Mkt Cap"] = view["Mkt Cap"].apply(lambda x: "" if pd.isna(x) else f"${x/1e9:.1f}B")
     view["Price"] = view["Price"].apply(lambda x: "" if pd.isna(x) else f"${x:,.2f}")
 
     st.success(f"Found {len(view)} matches.")
     st.dataframe(view, use_container_width=True)
 
-    # Download CSV (raw numeric values)
-    numeric_out = df[[
-        "symbol", "security", "sector", "last_price", "ret_3m", "ret_6m",
-        "revenue_ttm", "rev_ttm_growth", "op_margin", "net_margin", "marketCap"
-    ]].copy()
+    # Download numeric (unformatted)
+    numeric_out = df[
+        [
+            "symbol",
+            "security",
+            "sector",
+            "last_price",
+            "ret_3m",
+            "ret_6m",
+            "revenue_ttm",
+            "rev_ttm_growth",
+            "op_margin",
+            "net_margin",
+            "marketCap",
+        ]
+    ].copy()
+    st.download_button(
+        "Download results (CSV)",
+        data=numeric_out.to_csv(index=False).encode("utf-8"),
+        file_name="unloved_profitable_screen.csv",
+        mime="text/csv",
+    )
 
-    csv = numeric_out.to_csv(index=False).encode("utf-8")
-    st.download_button("Download results (CSV)", data=csv, file_name="unloved_profitable_screen.csv", mime="text/csv")
-
-    # Detail panel
+    # Drilldown
     st.markdown("---")
     st.subheader("🔎 Drilldown")
     sel = st.selectbox("Pick a ticker to view price & key metrics", options=df["symbol"].unique())
     if sel:
-        left, right = st.columns([1,1])
+        left, right = st.columns([1, 1])
         with left:
             st.markdown(f"### {sel} price (1y)")
             try:
                 hist = yf.download(sel, period="1y", interval="1d", auto_adjust=True, progress=False)
-                st.line_chart(hist["Close"])  # Streamlit handles styling
-            except Exception as e:
+                if "Close" in hist.columns and not hist["Close"].empty:
+                    st.line_chart(hist["Close"])
+                else:
+                    st.info("Price chart unavailable for this ticker.")
+            except Exception:
                 st.info("Price chart unavailable.")
         with right:
             row = df[df.symbol == sel].iloc[0]
-            st.metric("3m return", fmt_pct(row.get("ret_3m")))
-            st.metric("6m return", fmt_pct(row.get("ret_6m")))
-            st.metric("Revenue TTM YoY", fmt_pct(row.get("rev_ttm_growth")))
-            st.metric("Op margin (TTM)", fmt_pct(row.get("op_margin")))
-            st.metric("Net margin (TTM)", fmt_pct(row.get("net_margin")))
+            st.metric("3m return", _fmt_pct(row.get("ret_3m")))
+            st.metric("6m return", _fmt_pct(row.get("ret_6m")))
+            st.metric("Revenue TTM YoY", _fmt_pct(row.get("rev_ttm_growth")))
+            st.metric("Op margin (TTM)", _fmt_pct(row.get("op_margin")))
+            st.metric("Net margin (TTM)", _fmt_pct(row.get("net_margin")))
             mc = row.get("marketCap")
             st.metric("Market cap", "N/A" if pd.isna(mc) else f"${mc/1e9:.1f}B")
 
-# --------------------------
-# Footer notes
-# --------------------------
-
 st.caption(
-    "Data: Yahoo Finance via yfinance & yahooquery. Margins are computed from TTM sums of the last 4 quarters; growth compares last 4 vs prior 4 quarters."
+    "Notes: 3m≈63 trading days; 6m≈126 trading days. Margins computed from TTM (sum of last 4 quarters). "
+    "Revenue growth compares last 4 quarters vs previous 4 quarters. Some tickers may not return complete data."
 )
-
-
